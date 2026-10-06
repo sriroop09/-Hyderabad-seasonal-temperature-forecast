@@ -1,0 +1,248 @@
+"""Streamlit app: Seasonal Temperature Trend Analysis and 2030 Forecasting (Hyderabad).
+
+Display layer only. Every number comes from the functions in model.py, the
+same ones the notebook validates. Run with:  streamlit run app.py
+"""
+
+from pathlib import Path
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+import model
+
+DATA_PATH = Path(__file__).parent / "data" / "hyderabad_weather.xlsx"
+
+# Theme colour name for each season (defined in .streamlit/config.toml)
+SEASON_THEME = {"Winter": "blue", "Summer": "orange", "Monsoon": "green", "Autumn": "yellow"}
+SEASON_MONTHS = {"Winter": "Dec – Feb", "Summer": "Mar – May", "Monsoon": "Jun – Sep", "Autumn": "Oct – Nov"}
+
+
+@st.cache_data(show_spinner="Running the analysis…", max_entries=1)
+def run_analysis(path):
+    """Load → seasons → aggregate → statistics → models → evaluation → 2030 forecast."""
+    daily = model.assign_season(model.load_data(path))
+    seasonal = model.build_seasonal_table(daily)
+    simple_models = model.train_simple_models(seasonal)
+    multiple_model = model.train_multiple_model(seasonal)
+    # Simple LR line from each season's first year to 2030, drawn under the actual points
+    trend_years = pd.DataFrame({"Year": [seasonal["Year"].min(), model.FORECAST_YEAR]})
+    trend = pd.concat(
+        [trend_years.assign(Season=s, Trend=simple_models[s].predict(trend_years)) for s in model.SEASON_ORDER]
+    )
+    return {
+        "first_day": daily["date"].min(),
+        "last_day": daily["date"].max(),
+        "n_days": len(daily),
+        "seasonal": seasonal,
+        "stats": model.seasonal_statistics(daily),
+        "slopes": model.simple_coefficients(simple_models, seasonal),
+        "evaluation": model.evaluate_models(seasonal, simple_models, multiple_model),
+        "coefficients": model.multiple_coefficients(multiple_model),
+        "forecast": model.forecast_2030(seasonal, simple_models, multiple_model),
+        "trend": trend,
+    }
+
+
+# Every season chart spans the same 6 °C (room for the 2030 point), so slopes compare across seasons
+FORECAST_Y_SPAN = 6.0
+LABEL_COLOR = "#5e4843"
+
+
+def forecast_chart(seasonal, trend, forecast_row, season):
+    """One season: actual yearly averages (solid), Simple LR trend (dashed) and the 2030 forecast (ring)."""
+    data = seasonal.loc[seasonal["Season"] == season, ["Year", "Average_Temperature"]].sort_values("Year")
+    line_data = trend[trend["Season"] == season]
+    point_2030 = pd.DataFrame({"Year": [model.FORECAST_YEAR], "Forecast": [forecast_row["Simple LR (°C)"]]})
+    color = model.SEASON_COLORS[season]
+    # Label a point below the line when it is lower than both neighbours, so it stays off the line
+    temps = data["Average_Temperature"].tolist()
+    data["Below"] = [all(t < n for n in temps[max(i - 1, 0):i] + temps[i + 1:i + 2]) for i, t in enumerate(temps)]
+
+    values = temps + line_data["Trend"].tolist() + point_2030["Forecast"].tolist()
+    mid = (min(values) + max(values)) / 2
+    years = sorted(seasonal["Year"].unique())
+    x_scale = alt.Scale(domain=[years[0] - 0.4, model.FORECAST_YEAR + 0.6], nice=False)
+    x_axis = alt.Axis(values=years + [model.FORECAST_YEAR], format="d", grid=False, labelColor=LABEL_COLOR)
+    y_scale = alt.Scale(domain=[mid - FORECAST_Y_SPAN / 2, mid + FORECAST_Y_SPAN / 2], nice=False)
+    x = alt.X("Year:Q", title=None, scale=x_scale, axis=x_axis)
+
+    # Shaded forecast zone after the last historical year
+    zone = alt.Chart(pd.DataFrame({"start": [years[-1] + 0.5], "end": [model.FORECAST_YEAR + 0.6]}))
+    band = zone.mark_rect(color="#f8f1e7").encode(x=alt.X("start:Q", scale=x_scale, axis=x_axis, title=None), x2="end:Q")
+    band_label = zone.mark_text(align="left", baseline="top", dx=6, dy=6, fontSize=10, color="#8a746f").encode(
+        x="start:Q", y=alt.value(0), text=alt.value("FORECAST"))
+
+    trend_line = alt.Chart(line_data).mark_line(color=color, strokeWidth=1.5, strokeDash=[5, 4], opacity=0.7).encode(
+        x=x, y=alt.Y("Trend:Q", scale=y_scale))
+
+    actual = alt.Chart(data).encode(
+        x=x,
+        y=alt.Y("Average_Temperature:Q", title="°C", scale=y_scale, axis=alt.Axis(labelColor=LABEL_COLOR)),
+        tooltip=[alt.Tooltip("Year:Q", format="d"),
+                 alt.Tooltip("Average_Temperature:Q", title="Actual average °C", format=".2f")],
+    )
+    line = actual.mark_line(color=color, strokeWidth=2.5)
+    points = actual.mark_circle(color=color, size=70, opacity=1, stroke="white", strokeWidth=1.5)
+    label = alt.Text("Average_Temperature:Q", format=".2f")
+    above = actual.transform_filter("!datum.Below").mark_text(dy=-12, fontSize=11, color=LABEL_COLOR).encode(text=label)
+    below = actual.transform_filter("datum.Below").mark_text(dy=15, fontSize=11, color=LABEL_COLOR).encode(text=label)
+
+    predicted = alt.Chart(point_2030).encode(
+        x=x, y=alt.Y("Forecast:Q", scale=y_scale),
+        tooltip=[alt.Tooltip("Year:Q", format="d"),
+                 alt.Tooltip("Forecast:Q", title="Simple LR forecast °C", format=".2f")],
+    )
+    ring = predicted.mark_point(shape="circle", size=150, filled=True, fill="white", stroke=color, strokeWidth=3,
+                              opacity=1)
+    ring_label = predicted.mark_text(dy=-16, fontSize=12, fontWeight="bold", color=color).encode(
+        text=alt.Text("Forecast:Q", format=".2f"))
+
+    return alt.layer(band, band_label, trend_line, line, points, above, below, ring, ring_label).properties(height=250)
+
+
+st.set_page_config(page_title="Hyderabad seasonal temperatures", page_icon=":material/thermostat:")
+
+results = run_analysis(DATA_PATH)
+seasonal = results["seasonal"]
+stats = results["stats"]
+forecast = results["forecast"]
+
+# ---------------------------------------------------------------------------
+# Header: title, location and historical period (kept small)
+# ---------------------------------------------------------------------------
+st.title(":red[Seasonal Temperature Trend Analysis and 2030 Forecasting]")
+st.caption(
+    f":material/location_on: Hyderabad, Telangana, India  ·  "
+    f"Daily data {results['first_day']:%d %b %Y} – {results['last_day']:%d %b %Y} "
+    f"({results['n_days']:,} days)  ·  Seasonal averages {seasonal['Year'].min()}–{seasonal['Year'].max()}"
+)
+st.caption("Winter includes the previous December. Autumn 2026 is not available (the data ends in September 2026).")
+
+# ---------------------------------------------------------------------------
+# Seasonal trends and the 2030 forecast: one card per season
+# ---------------------------------------------------------------------------
+st.header(f":red[Seasonal trends and {model.FORECAST_YEAR} forecast]")
+st.caption(
+    f"Solid line: actual seasonal averages {seasonal['Year'].min()}–{seasonal['Year'].max()}  ·  "
+    f"Dashed line: Simple Linear Regression trend  ·  Ring: {model.FORECAST_YEAR} predicted temperature.  "
+    f"Every chart spans {FORECAST_Y_SPAN:.0f} °C, so the slopes can be compared across seasons."
+)
+
+for _, row in forecast.iterrows():
+    season, color = row["Season"], SEASON_THEME[row["Season"]]
+    predicted, latest, latest_year = row["Simple LR (°C)"], row["Latest Historical (°C)"], row["Latest Year"]
+    # From the displayed (rounded) values, so the increase matches what the reader sees
+    change = round(predicted, 2) - round(latest, 2)
+    arrow = "↑" if change >= 0 else "↓"
+
+    with st.container(border=True):
+        st.markdown(f"#### :{color}[{season.upper()}] :gray[· {SEASON_MONTHS[season]}]")
+        chart_col, figures_col = st.columns([2.3, 1], gap="medium", vertical_alignment="center")
+        with chart_col:
+            st.altair_chart(forecast_chart(seasonal, results["trend"], row, season))
+        with figures_col:
+            st.markdown(f":gray[{model.FORECAST_YEAR} Predicted Temperature]")
+            st.markdown(f"## :{color}[{predicted:.2f} °C]")
+            st.markdown(f":gray[Increase from {latest_year}]")
+            st.markdown(f"### :red[{change:+.1f} °C {arrow}]")
+            st.caption(f"Actual {latest_year} average: {latest:.2f} °C")
+            if latest_year != seasonal["Year"].max():
+                st.caption(f"No {season} {seasonal['Year'].max()} data yet, so the latest year is {latest_year}.")
+
+# ---------------------------------------------------------------------------
+# Seasonal statistics
+# ---------------------------------------------------------------------------
+st.header(":red[Seasonal statistics]")
+
+for col, season in zip(st.columns(4, border=True), model.SEASON_ORDER):
+    with col:
+        color = SEASON_THEME[season]
+        st.markdown(f":{color}[**{season}**]  \n:gray[{SEASON_MONTHS[season]} · mean]")
+        st.markdown(f"### :{color}[{stats.loc[season, 'Mean']:.2f} °C]")
+
+stats_table = stats.reset_index()
+stats_table.insert(1, "Months", stats_table["Season"].map(SEASON_MONTHS))
+st.dataframe(
+    stats_table,
+    hide_index=True,
+    column_config={
+        "Mean": st.column_config.NumberColumn("Mean (°C)", format="%.2f"),
+        "Median": st.column_config.NumberColumn("Median (°C)", format="%.2f"),
+        "Minimum": st.column_config.NumberColumn("Min (°C)", format="%.2f"),
+        "Maximum": st.column_config.NumberColumn("Max (°C)", format="%.2f"),
+        "Variance": st.column_config.NumberColumn("Variance", format="%.2f"),
+        "Std_Dev": st.column_config.NumberColumn("Std dev", format="%.2f"),
+    },
+)
+
+# ---------------------------------------------------------------------------
+# Regression models
+# ---------------------------------------------------------------------------
+st.header(":red[Regression models]")
+
+st.subheader("Simple linear regression")
+st.caption("Four models, one per season: Year → seasonal average temperature.")
+simple_table = results["slopes"][["Season", "Slope (°C/year)"]].merge(results["evaluation"]["simple"], on="Season")
+metric_format = {m: st.column_config.NumberColumn(m, format="%.3f") for m in ["R²", "MAE", "MSE", "RMSE"]}
+st.dataframe(
+    simple_table,
+    hide_index=True,
+    column_config={"Slope (°C/year)": st.column_config.NumberColumn("Trend (°C/year)", format="%+.3f"),
+                   **metric_format},
+)
+
+st.subheader("Multiple linear regression")
+coefs = results["coefficients"].set_index("Feature")["Coefficient"]
+st.caption(
+    f"One model on all {len(seasonal)} points: Year + Season → temperature. "
+    f"Shared trend **{coefs['Year']:+.3f} °C/year**; compared with Winter, "
+    f"Summer is {coefs['Season_Summer']:+.2f} °C, Monsoon {coefs['Season_Monsoon']:+.2f} °C "
+    f"and Autumn {coefs['Season_Autumn']:+.2f} °C."
+)
+st.dataframe(results["evaluation"]["multiple"], hide_index=True, column_config=metric_format)
+st.info(
+    "The two R² values are not comparable: the multiple model's high R² comes mainly from Season "
+    "(the gap between hot and cool seasons), not from Year.",
+    icon=":material/info:",
+)
+
+st.subheader(f"{model.FORECAST_YEAR} forecast: Simple vs Multiple linear regression")
+st.caption("The season cards above use Simple LR; the Multiple LR forecast is shown here for comparison.")
+st.dataframe(
+    forecast,
+    hide_index=True,
+    column_config={
+        "Simple LR (°C)": st.column_config.NumberColumn(f"Simple LR {model.FORECAST_YEAR} (°C)", format="%.2f"),
+        "Multiple LR (°C)": st.column_config.NumberColumn(f"Multiple LR {model.FORECAST_YEAR} (°C)", format="%.2f"),
+        "Latest Historical (°C)": st.column_config.NumberColumn(format="%.2f"),
+        "Latest Year": st.column_config.NumberColumn(format="%d"),
+    },
+)
+
+# ---------------------------------------------------------------------------
+# Environmental interpretation and limitations
+# ---------------------------------------------------------------------------
+st.header(":red[Environmental interpretation and limitations]")
+st.markdown(
+    "All four seasons warmed over 2022–2026, most in Summer and least in Monsoon. "
+    "This is consistent with factors that commonly contribute to warming in fast-growing cities like Hyderabad:\n"
+    "- Rapid urbanisation and the urban heat-island effect\n"
+    "- Land-use change from open and agricultural land to built surfaces\n"
+    "- Loss of green cover and water bodies\n"
+    "- Regional and global greenhouse-gas emissions\n"
+    "- Rising energy demand, including cooling\n\n"
+    "Natural year-to-year variability, such as the cool Summer 2023 or the hot June 2026, "
+    "also moves the seasonal averages."
+)
+st.warning(
+    "**Regression shows a statistical relationship with Year, not causation.** "
+    "It does not prove that any of these factors caused the change. Each trend comes from only 4–5 points "
+    f"per season (2022–2026), and the {model.FORECAST_YEAR} forecasts extend it 4 years beyond the data, "
+    "so they are highly uncertain.",
+    icon=":material/warning:",
+)
+
+st.divider()
+st.caption("Data: Hyderabad daily weather (temperature_2m_mean)  ·  Method: scikit-learn LinearRegression")
